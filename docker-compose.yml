@@ -1,0 +1,15 @@
+services:
+  # The 30-second trace viewer (plan O3). OTLP/HTTP lands on 6006 at
+  # /v1/traces; 4317 is OTLP/gRPC, unused by this slice's HTTP exporter but
+  # exposed for anything else that wants it. Postgres (spine-pg) is started
+  # separately — this compose file owns only the observability viewer.
+  phoenix:
+    image: arizephoenix/phoenix:latest
+    ports:
+      - "6006:6006"
+      - "4317:4317"
+    volumes:
+      - phoenix-data:/mnt/data
+
+volumes:
+  phoenix-data:

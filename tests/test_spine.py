@@ -5,14 +5,29 @@ Hits real Postgres — mocking SKIP LOCKED / ON CONFLICT tests nothing (plan §5
 import asyncio
 
 import pytest
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+from spine import alerts, metrics
 from spine.db import Settings, run_migrations
 from spine.handlers import echo_handler, register  # noqa: F401  (registers demo handler)
 from spine.model import HandlerResult, RetryableError, TerminalError
 from spine.queue import claim, complete, enqueue, reap, replay
+from spine.tracing import build_hooks
 from spine.worker import run as worker_run
+
+# One process-wide TracerProvider backed by an in-memory exporter (plan O5's
+# accept check needs finished spans, not a live Phoenix). Set once at import,
+# same pattern as spine.tracing.bootstrap_tracing but swapping the OTLP
+# exporter for something a test can read back.
+_span_exporter = InMemorySpanExporter()
+_test_provider = TracerProvider()
+_test_provider.add_span_processor(SimpleSpanProcessor(_span_exporter))
+trace.set_tracer_provider(_test_provider)
 
 # Test-only handlers for the failure taxonomy (plan §4). Registered at import
 # time like the demo handler; kept here rather than in spine.handlers because
@@ -71,7 +86,7 @@ async def pool():
     async with p.connection() as conn:
         await run_migrations(conn)
         async with conn.cursor() as cur:
-            await cur.execute("TRUNCATE events, jobs, attempts, llm_calls CASCADE")
+            await cur.execute("TRUNCATE events, jobs, attempts, llm_calls, alerts CASCADE")
         await conn.commit()
     yield p
     await p.close()
@@ -434,3 +449,153 @@ async def test_replay_refuses_a_job_that_is_not_dead_lettered(pool):
 
     assert refused is None, "replay must refuse a succeeded job"
     assert job_count == 1, f"expected no duplicate job for the event, found {job_count}"
+
+
+async def test_retry_then_succeed_is_one_trace_two_attempt_spans(pool):
+    """O5's acceptance check: a job that fails once and succeeds on retry
+    produces ONE trace with two `attempt` spans, both children of the same
+    `task` span — this is what makes retry rate and end-to-end latency
+    computable at all (plan §2)."""
+    _span_exporter.clear()
+    async with pool.connection() as conn:
+        job_id, _ = await enqueue(
+            conn,
+            source="test",
+            type="flaky",
+            payload={},
+            idempotency_key="trace-flaky-key",
+            trace_id="trace-flaky-2",
+            handler_name="test:flaky",
+            variant="default",
+        )
+
+    stop_event = asyncio.Event()
+    worker_task = asyncio.create_task(
+        worker_run(
+            pool,
+            stop_event,
+            lease_seconds=30,
+            poll_interval_seconds=0.1,
+            hooks=build_hooks(pool),
+        )
+    )
+    try:
+        row = await _poll_until(pool, job_id, {"succeeded", "dead_letter"})
+    finally:
+        stop_event.set()
+        await worker_task
+
+    assert row["state"] == "succeeded"
+
+    spans = _span_exporter.get_finished_spans()
+    task_spans = [
+        s for s in spans if s.name == "task" and s.attributes.get("app.job_id") == str(job_id)
+    ]
+    attempt_spans = [
+        s
+        for s in spans
+        if s.name == "attempt" and s.attributes.get("app.job_id") == str(job_id)
+    ]
+
+    assert len(task_spans) == 1
+    assert len(attempt_spans) == 3  # flaky fails twice, succeeds on the 3rd
+    trace_id = task_spans[0].context.trace_id
+    assert all(s.context.trace_id == trace_id for s in attempt_spans)
+    assert all(s.parent.span_id == task_spans[0].context.span_id for s in attempt_spans)
+    assert task_spans[0].attributes["app.terminal_status"] == "success"
+
+
+async def test_dead_letter_share_past_alert_threshold(pool):  # CLAUDE_SECRET_ALLOW
+    """O7's failure_rate kind — the only alert kind with a real producer on
+    this slice (runaway_loop and cost_anomaly have none; see spine.alerts).
+    13 succeeded + 7 dead_letter over N=20 is a 35% dead-letter share, over
+    the 30% threshold."""
+    variant = "alert-test-variant"
+    async with pool.connection() as conn:
+        for i in range(13):
+            job_id, _ = await enqueue(
+                conn,
+                source="demo",
+                type="echo",
+                payload={"i": i},
+                idempotency_key=f"dl-ok-{i}",
+                trace_id=f"t-ok-{i}",
+                handler_name="demo:echo",
+                variant=variant,
+            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE jobs SET state = 'succeeded' WHERE id = %s", (job_id,)
+                )
+
+        for i in range(7):
+            job_id, _ = await enqueue(
+                conn,
+                source="demo",
+                type="echo",
+                payload={"i": i},
+                idempotency_key=f"dl-bad-{i}",
+                trace_id=f"t-bad-{i}",
+                handler_name="demo:echo",
+                variant=variant,
+            )
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE jobs SET state = 'dead_letter' WHERE id = %s", (job_id,)
+                )
+
+        await alerts.check_and_raise_failure_rate(conn, job_id=job_id, variant=variant)
+
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT kind, variant, detail_json FROM alerts WHERE variant = %s",
+                (variant,),
+            )
+            rows = await cur.fetchall()
+
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "failure_rate"
+    assert rows[0]["variant"] == variant
+    assert rows[0]["detail_json"]["failure_rate"] > 0.3
+
+
+async def test_task_metrics_view_and_percentiles(pool):
+    """O6 + plan §4: task_metrics has a row per terminal task with
+    duration_ms from the attempt rollup, and percentile_cont computes
+    p50/p95 over it — Postgres is available so this is the live path, not
+    the plan's SQLite fallback (00-SEAMS open question 4)."""
+    variant = "percentile-test-variant"
+    durations_s = [0.1, 0.2, 0.3, 0.4, 0.5]
+    async with pool.connection() as conn:
+        for i, secs in enumerate(durations_s):
+            await enqueue(
+                conn,
+                source="demo",
+                type="echo",
+                payload={},
+                idempotency_key=f"pct-{i}",
+                trace_id=f"t-pct-{i}",
+                handler_name="demo:echo",
+                variant=variant,
+            )
+            claimed = await claim(conn, lease_seconds=30)
+            assert claimed is not None
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "UPDATE attempts SET started_at = now() - make_interval(secs => %s) "
+                    "WHERE id = %s",
+                    (secs, claimed.attempt_id),
+                )
+            await complete(conn, claimed, HandlerResult(output={"ok": True}))
+
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT count(*) AS n FROM task_metrics WHERE variant = %s", (variant,)
+            )
+            n = (await cur.fetchone())["n"]
+
+        result = await metrics.latency_percentiles(conn, variant)
+
+    assert n == len(durations_s)
+    assert 380 <= result["p95_ms"] <= 520
+    assert 250 <= result["p50_ms"] <= 350

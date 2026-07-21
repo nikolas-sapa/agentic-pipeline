@@ -94,12 +94,15 @@ async def run(
 
 
 def main() -> None:
-    """Composition root: hooks are wired here (or replaced here by capability
-    2), never monkeypatched onto the module."""
+    """Composition root: hooks are wired here, never monkeypatched onto the
+    module. build_hooks() (capability 2) is the real tracing/alerting
+    implementation of the four no-op hooks above."""
     from spine.db import Settings, make_pool
+    from spine.tracing import bootstrap_tracing, build_hooks
 
     settings = Settings.from_env()
     pool = make_pool(settings)
+    bootstrap_tracing()
     stop_event = asyncio.Event()
 
     async def _run():
@@ -110,7 +113,7 @@ def main() -> None:
                 stop_event,
                 lease_seconds=settings.lease_seconds,
                 poll_interval_seconds=settings.poll_interval_seconds,
-                hooks=Hooks(),
+                hooks=build_hooks(pool),
             )
         finally:
             await pool.close()
