@@ -1,14 +1,10 @@
-"""Dataclasses, enums, and the idempotency key derivation.
-
-ponytail: RetryPolicy / failure taxonomy (RetryableError, TerminalError) are
-plan §4 — retry/backoff is out of scope for the tracer bullet (tickets 4-5),
-so they aren't defined yet. Add them when `queue.fail()` lands.
-"""
+"""Dataclasses, enums, and the idempotency key derivation."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import random
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -74,3 +70,37 @@ class HandlerResult:
 
     output: dict[str, Any]
     llm_calls: list[dict[str, Any]] = field(default_factory=list)
+
+
+class RetryableError(Exception):
+    """Transient failure (plan §4): HTTP 429/5xx, connection reset, timeout,
+    provider overloaded, lease_expired. Retried with backoff until
+    RetryPolicy.max_attempts, then dead-lettered."""
+
+
+class TerminalError(Exception):
+    """Non-transient failure (plan §4): unknown handler, schema validation
+    failure, HTTP 4xx (non-429), budget exceeded, permanent auth failure.
+    Dead-letters immediately; attempts untouched."""
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    """Full-jitter exponential backoff (plan §4). At defaults: ~0-1s, 0-2s,
+    0-4s, 0-8s, then dead letter on the 5th failure."""
+
+    max_attempts: int = 5
+    base: float = 1.0
+    factor: float = 2.0
+    cap: float = 60.0
+
+    def delay_seconds(self, attempt_number: int) -> float:
+        return random.uniform(0, min(self.cap, self.base * self.factor ** (attempt_number - 1)))
+
+
+# ponytail: one policy for every Trigger. `Trigger` (plan §1: (source, type) ->
+# handler + retry policy) isn't a real module yet — handlers.py is just a
+# registry, no policy table. Per-Trigger override is plan §9's explicit
+# non-goal anyway ("no retry policy per-job override at runtime"), so a
+# single default earns its keep until a Trigger dict exists to key off of.
+DEFAULT_RETRY_POLICY = RetryPolicy()

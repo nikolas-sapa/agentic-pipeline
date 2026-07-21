@@ -3,10 +3,6 @@
 Four hooks (plan §6.1, per 00-SEAMS R3): on_job_start, on_attempt_start,
 on_attempt_end, on_job_finish. No-op by default, passed into run() at the
 composition root (main() below) — not monkeypatched over the module.
-
-ponytail: no reaper call, no fail()/retry dispatch yet (plan §1's "crash
-recovery" and §4 are tickets 6/4-5). The demo handler is deterministic and
-never raises, so there's nothing to reap or retry in this pass.
 """
 
 from __future__ import annotations
@@ -18,8 +14,8 @@ from typing import Awaitable, Callable
 from psycopg_pool import AsyncConnectionPool
 
 from spine import handlers
-from spine.model import JobContext
-from spine.queue import claim, complete
+from spine.model import JobContext, JobState
+from spine.queue import claim, complete, fail, reap
 
 Hook = Callable[..., Awaitable[None]]
 
@@ -47,6 +43,10 @@ async def run(
     while not stop_event.is_set():
         claimed = None
         async with pool.connection() as conn:
+            # Every poll reaps first (plan §1): stale `running` rows from a
+            # crashed worker get their attempt closed and routed through the
+            # same retry-vs-dead_letter decision as a normal failure.
+            await reap(conn)
             claimed = await claim(conn, lease_seconds)
 
         if claimed is None:
@@ -68,8 +68,22 @@ async def run(
         await hooks.on_job_start(ctx)
         await hooks.on_attempt_start(ctx)
 
-        handler = handlers.resolve(claimed.event)
-        result = await handler(ctx)
+        try:
+            handler = handlers.resolve(claimed.event)
+            result = await handler(ctx)
+        except Exception as error:
+            # Taxonomy classification (RetryableError vs TerminalError vs
+            # an undeclared bug) and the retry-vs-dead_letter decision both
+            # live in queue.fail() — the worker just routes the exception
+            # there (plan §4).
+            await hooks.on_attempt_end(ctx, "failed")
+            async with pool.connection() as conn:
+                new_state = await fail(conn, claimed, error)
+            # on_job_finish fires only when the job reaches a terminal state;
+            # a job requeued for retry isn't finished yet.
+            if new_state == JobState.DEAD_LETTER:
+                await hooks.on_job_finish(ctx, "dead_lettered")
+            continue
 
         await hooks.on_attempt_end(ctx, "succeeded")
 

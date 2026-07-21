@@ -1,10 +1,5 @@
 """spine.queue — the deep module. All SQL, the SKIP LOCKED claim, and the
 idempotency race live here and nowhere else (plan §2).
-
-ponytail: only enqueue/claim/complete exist. fail()/reap()/replay() are
-plan §2's full interface but belong to tickets 4-7 (retry, dead letter,
-lease recovery, replay) — out of scope for the tracer bullet. The happy-path
-demo handler never fails, so there is nothing for them to do yet.
 """
 
 from __future__ import annotations
@@ -16,13 +11,23 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from spine.model import Event, HandlerResult, Job, JobState
+from spine.model import (
+    DEFAULT_RETRY_POLICY,
+    Event,
+    HandlerResult,
+    Job,
+    JobState,
+    RetryableError,
+    TerminalError,
+)
 
 
 @dataclass(frozen=True)
 class Claimed:
     job: Job
-    event: Event
+    # None for a job reap() reconstructs from a stale `running` row — reap
+    # never needs the Event, only claim() (the worker's handler dispatch does).
+    event: Event | None
     attempt_id: UUID
     attempt_number: int
 
@@ -182,3 +187,155 @@ async def complete(
             "UPDATE jobs SET state = %s, output = %s WHERE id = %s",
             (JobState.SUCCEEDED, Json(result.output), claimed.job.id),
         )
+
+
+def _classify(error: BaseException) -> tuple[str, bool]:
+    """(error_class, is_terminal). RetryableError/TerminalError carry their
+    own code as the message (e.g. TerminalError("budget_exceeded")); an
+    undeclared exception is a bug in the handler — treated as retryable until
+    it exhausts attempts, per plan §4's third taxonomy row."""
+    if isinstance(error, TerminalError):
+        return str(error), True
+    if isinstance(error, RetryableError):
+        return str(error), False
+    return type(error).__name__, False
+
+
+async def fail(conn: AsyncConnection, claimed: Claimed, error: BaseException) -> JobState:
+    """Close the open attempt as failed and decide retry-vs-dead_letter
+    (plan §4): TerminalError dead-letters immediately with attempts
+    untouched; anything else retries with full-jitter backoff until
+    DEFAULT_RETRY_POLICY.max_attempts, then dead-letters with the last error
+    preserved on the job row. Returns the job's new state so the worker
+    knows whether the job just became terminal."""
+    error_class, is_terminal = _classify(error)
+
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            UPDATE attempts SET
+                state = 'failed', ended_at = now(),
+                -- EPOCH, not MILLISECONDS: see complete()'s comment above.
+                duration_ms = (EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::int,
+                error_class = %s, error = %s
+            WHERE id = %s
+            """,
+            (error_class, str(error), claimed.attempt_id),
+        )
+
+        if is_terminal or claimed.attempt_number >= DEFAULT_RETRY_POLICY.max_attempts:
+            new_state = JobState.DEAD_LETTER
+            await cur.execute(
+                """
+                UPDATE jobs SET state = %s, last_error_class = %s, last_error = %s
+                WHERE id = %s
+                """,
+                (new_state, error_class, str(error), claimed.job.id),
+            )
+        else:
+            new_state = JobState.PENDING
+            delay = DEFAULT_RETRY_POLICY.delay_seconds(claimed.attempt_number)
+            await cur.execute(
+                """
+                UPDATE jobs SET
+                    state = %s, run_after = now() + make_interval(secs => %s),
+                    last_error_class = %s, last_error = %s
+                WHERE id = %s
+                """,
+                (new_state, delay, error_class, str(error), claimed.job.id),
+            )
+
+    return new_state
+
+
+async def reap(conn: AsyncConnection) -> int:
+    """Find state='running' jobs whose lease expired, close the open
+    attempt as failed with error_class='lease_expired', and route through
+    fail()'s retry-vs-dead_letter decision (plan §1's crash recovery: the
+    claim predicate stays narrow; this is the one place that reclaims stale
+    leases). One transaction; FOR UPDATE SKIP LOCKED makes concurrent
+    reaping across workers safe. Returns the number of jobs reaped."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT id, event_id, handler_name, state, attempt_count, variant, trace_id
+            FROM jobs
+            WHERE state = 'running' AND lease_expires_at < now()
+            FOR UPDATE SKIP LOCKED
+            """
+        )
+        rows = await cur.fetchall()
+
+        reaped = 0
+        for row in rows:
+            await cur.execute(
+                "SELECT id FROM attempts WHERE job_id = %s AND state = 'running'",
+                (row["id"],),
+            )
+            attempt_row = await cur.fetchone()
+            if attempt_row is None:
+                continue  # nothing open on this job to reap
+
+            claimed = Claimed(
+                job=Job(
+                    id=row["id"],
+                    event_id=row["event_id"],
+                    handler_name=row["handler_name"],
+                    state=JobState(row["state"]),
+                    attempt_count=row["attempt_count"],
+                    variant=row["variant"],
+                    trace_id=row["trace_id"],
+                ),
+                event=None,
+                attempt_id=attempt_row["id"],
+                attempt_number=row["attempt_count"],
+            )
+            await fail(conn, claimed, RetryableError("lease_expired"))
+            reaped += 1
+
+        return reaped
+
+
+async def replay(conn: AsyncConnection, job_id: UUID) -> UUID | None:
+    """Insert a fresh Job from the dead-lettered job's Event, attempt_count=0,
+    replay_of=<old job>. Never resurrects the old job (plan §1, §4) — the
+    original stays in whatever state it was in, lineage is kept via
+    replay_of.
+
+    Only dead-lettered jobs are replayable. Without that predicate, replaying
+    a *succeeded* job mints a second job for the same Event and re-runs the
+    handler — routing straight around the idempotency guarantee that is the
+    whole point of the ingress. The unique index on events.idempotency_key
+    cannot help here: the Event already exists, so nothing conflicts.
+
+    ponytail: returns None for both "no such job" and "not dead-lettered"
+    rather than distinguishing them with an exception type. The caller says so
+    in one message. Split it if an operator ever needs 404-vs-409.
+    """
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            "SELECT event_id, handler_name, variant, trace_id FROM jobs "
+            "WHERE id = %s AND state = %s",
+            (job_id, JobState.DEAD_LETTER),
+        )
+        row = await cur.fetchone()
+        if row is None:
+            return None
+
+        await cur.execute(
+            """
+            INSERT INTO jobs (event_id, handler_name, state, trace_id, variant, replay_of)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                row["event_id"],
+                row["handler_name"],
+                JobState.PENDING,
+                row["trace_id"],
+                row["variant"],
+                job_id,
+            ),
+        )
+        new_row = await cur.fetchone()
+        return new_row["id"]

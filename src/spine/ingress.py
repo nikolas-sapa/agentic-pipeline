@@ -1,9 +1,5 @@
 """spine.ingress — FastAPI app. Interface = the HTTP surface. Thin by
 design: parse, build Event, enqueue, return (plan §2).
-
-ponytail: only POST /events, GET /jobs/{id}, GET /healthz exist. POST
-/jobs/{id}/replay and GET /jobs?state=dead_letter are ticket 7 (DLQ + replay)
-— out of scope until the retry/dead-letter path lands.
 """
 
 from __future__ import annotations
@@ -18,7 +14,7 @@ from pydantic import BaseModel
 
 from spine.db import Settings, make_pool, run_migrations
 from spine.model import idempotency_key
-from spine.queue import enqueue
+from spine.queue import enqueue, replay
 
 app = FastAPI(title="spine")
 settings = Settings.from_env()
@@ -95,6 +91,51 @@ async def get_job(job_id: UUID):
         "output": row["output"],
         "trace_id": row["trace_id"],
     }
+
+
+@app.get("/jobs")
+async def list_jobs(state: str | None = None):
+    """The DLQ view is a query, not a table (plan §1): `GET /jobs?state=dead_letter`
+    is `SELECT * FROM jobs WHERE state='dead_letter'`."""
+    query = (
+        "SELECT id, state, attempt_count, variant, trace_id, "
+        "last_error_class, last_error FROM jobs"
+    )
+    params: tuple = ()
+    if state is not None:
+        query += " WHERE state = %s"
+        params = (state,)
+
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(query, params)
+            rows = await cur.fetchall()
+
+    return [
+        {
+            "id": str(row["id"]),
+            "state": row["state"],
+            "attempt_count": row["attempt_count"],
+            "variant": row["variant"],
+            "trace_id": row["trace_id"],
+            "last_error_class": row["last_error_class"],
+            "last_error": row["last_error"],
+        }
+        for row in rows
+    ]
+
+
+@app.post("/jobs/{job_id}/replay", status_code=202)
+async def post_replay(job_id: UUID):
+    async with pool.connection() as conn:
+        new_job_id = await replay(conn, job_id)
+
+    if new_job_id is None:
+        raise HTTPException(
+            status_code=404, detail="job not found, or not dead-lettered"
+        )
+
+    return {"job_id": str(new_job_id)}
 
 
 @app.get("/healthz")
