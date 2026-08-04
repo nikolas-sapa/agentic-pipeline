@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in the spine, ingress, worker, or benchmark is broken.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened
+      description: What you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Commands run, request payloads, or the bench command used.
+      placeholder: |
+        1. uv run uvicorn spine.ingress:app --reload
+        2. POST /events with ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Error output, stack trace, or bench/data/logs excerpt. Paste as text, not a screenshot.
+      render: shell
+    validations:
+      required: false
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.14.5 (python3 --version)"
+    validations:
+      required: true
+  - type: input
+    id: postgres-version
+    attributes:
+      label: Postgres version
+      placeholder: "16 (psql --version or postgres --version)"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: "macOS 15.5 / Ubuntu 24.04 / ..."
+    validations:
+      required: false
