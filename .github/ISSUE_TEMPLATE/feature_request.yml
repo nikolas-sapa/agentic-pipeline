@@ -1,0 +1,25 @@
+name: Feature request
+description: Propose a change to the spine or the benchmark.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is missing or awkward today. Concrete failure or gap, not a wish list.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you'd add or change, and where it fits (ingress, worker, retry taxonomy, bench, etc).
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches, and why this one is preferred.
+    validations:
+      required: false

@@ -1,8 +1,28 @@
 # agentic-pipeline
 
+[![License: MIT](https://img.shields.io/badge/license-MIT-F3F2EE?style=flat-square&labelColor=0B0B0D)](LICENSE)
+[![Python >=3.12](https://img.shields.io/badge/python-3.12%2B-F3F2EE?style=flat-square&labelColor=0B0B0D)](pyproject.toml)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-F3F2EE?style=flat-square&labelColor=0B0B0D)](CONTRIBUTING.md)
+
 An event-driven LLM request pipeline (Postgres-backed queue, idempotent
 ingress, retry taxonomy, dead-letter, replay), and the benchmark that killed
 its cost-routing feature.
+
+## Quick start
+
+```
+make install                 # uv sync
+
+# spine (needs Postgres; DATABASE_URL defaults to postgresql://spine:spine@localhost:5432/spine)
+uv run uvicorn spine.ingress:app --reload
+uv run python -m spine.worker
+make test                    # pytest, against real Postgres
+
+# the finding below, reproduced offline in ~0.1s, no API key or network
+make bench-replay
+```
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for standing up Postgres locally.
 
 ## The finding
 
@@ -179,3 +199,14 @@ migrations/      plain .sql, applied in order
 tests/           against real Postgres
 bench/           the benchmark: replay.py, prices.py, RESULTS.md, live/, data/
 ```
+
+## Contributing
+
+Dev setup, running Postgres locally, tests, and reproducing the benchmark are
+in [`CONTRIBUTING.md`](CONTRIBUTING.md). Bug reports and feature requests use
+the issue templates; see [`SECURITY.md`](SECURITY.md) instead for
+vulnerabilities.
+
+## License
+
+[MIT](LICENSE)
