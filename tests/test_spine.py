@@ -10,10 +10,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from psycopg.rows import dict_row
-from psycopg_pool import AsyncConnectionPool
 
 from spine import alerts, metrics
-from spine.db import Settings, run_migrations
 from spine.handlers import echo_handler, register  # noqa: F401  (registers demo handler)
 from spine.model import HandlerResult, RetryableError, TerminalError
 from spine.queue import claim, complete, enqueue, reap, replay
@@ -76,20 +74,6 @@ async def _poll_until(pool, job_id, states, *, timeout=15.0, interval=0.1):
         await asyncio.sleep(interval)
         elapsed += interval
     return row
-
-
-@pytest.fixture
-async def pool():
-    settings = Settings.from_env()
-    p = AsyncConnectionPool(conninfo=settings.database_url, open=False)
-    await p.open()
-    async with p.connection() as conn:
-        await run_migrations(conn)
-        async with conn.cursor() as cur:
-            await cur.execute("TRUNCATE events, jobs, attempts, llm_calls, alerts CASCADE")
-        await conn.commit()
-    yield p
-    await p.close()
 
 
 async def test_tracer_bullet_reaches_succeeded(pool):

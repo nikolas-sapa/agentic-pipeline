@@ -161,32 +161,50 @@ async def claim(conn: AsyncConnection, lease_seconds: int) -> Claimed | None:
         )
 
 
-async def complete(
-    conn: AsyncConnection, claimed: Claimed, result: HandlerResult
-) -> None:
-    """Close the attempt and the job as succeeded. Every state change writes
-    an attempt row (plan §1 invariant) — claim() already opened it; this
-    closes it in the same lifecycle (`running -> succeeded`, plan §1)."""
+async def _owns_attempt(conn: AsyncConnection, claimed: Claimed) -> bool:
+    """Lock the job before checking ownership. The caller holds a transaction
+    across this check and every attempt/job write, including on autocommit
+    connections. Reaped or already-finished claims cannot write again."""
     async with conn.cursor() as cur:
         await cur.execute(
-            """
-            UPDATE attempts SET
-                state = 'succeeded',
-                ended_at = now(),
-                -- EPOCH, not MILLISECONDS: EXTRACT(MILLISECONDS FROM interval)
-                -- returns only the seconds field, so 1m2.5s reads as 2500 not
-                -- 62500. duration_ms feeds p95 latency; slow jobs would have
-                -- silently reported as fast.
-                duration_ms = (EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::int,
-                output = %s
-            WHERE id = %s
-            """,
-            (Json(result.output), claimed.attempt_id),
+            "SELECT 1 FROM jobs WHERE id = %s AND state = %s "
+            "AND attempt_count = %s FOR UPDATE",
+            (claimed.job.id, JobState.RUNNING, claimed.attempt_number),
         )
-        await cur.execute(
-            "UPDATE jobs SET state = %s, output = %s WHERE id = %s",
-            (JobState.SUCCEEDED, Json(result.output), claimed.job.id),
-        )
+        return await cur.fetchone() is not None
+
+
+async def complete(
+    conn: AsyncConnection, claimed: Claimed, result: HandlerResult
+) -> bool:
+    """Close the attempt and the job as succeeded. Every state change writes
+    an attempt row (plan §1 invariant) — claim() already opened it; this
+    closes it in the same lifecycle (`running -> succeeded`, plan §1).
+    Returns False with no writes when the claim no longer owns the job."""
+    async with conn.transaction():
+        if not await _owns_attempt(conn, claimed):
+            return False
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE attempts SET
+                    state = 'succeeded',
+                    ended_at = now(),
+                    -- EPOCH, not MILLISECONDS: EXTRACT(MILLISECONDS FROM interval)
+                    -- returns only the seconds field, so 1m2.5s reads as 2500 not
+                    -- 62500. duration_ms feeds p95 latency; slow jobs would have
+                    -- silently reported as fast.
+                    duration_ms = (EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::int,
+                    output = %s
+                WHERE id = %s
+                """,
+                (Json(result.output), claimed.attempt_id),
+            )
+            await cur.execute(
+                "UPDATE jobs SET state = %s, output = %s WHERE id = %s",
+                (JobState.SUCCEEDED, Json(result.output), claimed.job.id),
+            )
+    return True
 
 
 def _classify(error: BaseException) -> tuple[str, bool]:
@@ -201,49 +219,55 @@ def _classify(error: BaseException) -> tuple[str, bool]:
     return type(error).__name__, False
 
 
-async def fail(conn: AsyncConnection, claimed: Claimed, error: BaseException) -> JobState:
+async def fail(
+    conn: AsyncConnection, claimed: Claimed, error: BaseException
+) -> JobState | None:
     """Close the open attempt as failed and decide retry-vs-dead_letter
     (plan §4): TerminalError dead-letters immediately with attempts
     untouched; anything else retries with full-jitter backoff until
     DEFAULT_RETRY_POLICY.max_attempts, then dead-letters with the last error
     preserved on the job row. Returns the job's new state so the worker
-    knows whether the job just became terminal."""
+    knows whether the job just became terminal. Returns None with no writes
+    when the claim no longer owns the job."""
     error_class, is_terminal = _classify(error)
 
-    async with conn.cursor() as cur:
-        await cur.execute(
-            """
-            UPDATE attempts SET
-                state = 'failed', ended_at = now(),
-                -- EPOCH, not MILLISECONDS: see complete()'s comment above.
-                duration_ms = (EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::int,
-                error_class = %s, error = %s
-            WHERE id = %s
-            """,
-            (error_class, str(error), claimed.attempt_id),
-        )
+    async with conn.transaction():
+        if not await _owns_attempt(conn, claimed):
+            return None
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE attempts SET
+                    state = 'failed', ended_at = now(),
+                    -- EPOCH, not MILLISECONDS: see complete()'s comment above.
+                    duration_ms = (EXTRACT(EPOCH FROM (now() - started_at)) * 1000)::int,
+                    error_class = %s, error = %s
+                WHERE id = %s
+                """,
+                (error_class, str(error), claimed.attempt_id),
+            )
 
-        if is_terminal or claimed.attempt_number >= DEFAULT_RETRY_POLICY.max_attempts:
-            new_state = JobState.DEAD_LETTER
-            await cur.execute(
-                """
-                UPDATE jobs SET state = %s, last_error_class = %s, last_error = %s
-                WHERE id = %s
-                """,
-                (new_state, error_class, str(error), claimed.job.id),
-            )
-        else:
-            new_state = JobState.PENDING
-            delay = DEFAULT_RETRY_POLICY.delay_seconds(claimed.attempt_number)
-            await cur.execute(
-                """
-                UPDATE jobs SET
-                    state = %s, run_after = now() + make_interval(secs => %s),
-                    last_error_class = %s, last_error = %s
-                WHERE id = %s
-                """,
-                (new_state, delay, error_class, str(error), claimed.job.id),
-            )
+            if is_terminal or claimed.attempt_number >= DEFAULT_RETRY_POLICY.max_attempts:
+                new_state = JobState.DEAD_LETTER
+                await cur.execute(
+                    """
+                    UPDATE jobs SET state = %s, last_error_class = %s, last_error = %s
+                    WHERE id = %s
+                    """,
+                    (new_state, error_class, str(error), claimed.job.id),
+                )
+            else:
+                new_state = JobState.PENDING
+                delay = DEFAULT_RETRY_POLICY.delay_seconds(claimed.attempt_number)
+                await cur.execute(
+                    """
+                    UPDATE jobs SET
+                        state = %s, run_after = now() + make_interval(secs => %s),
+                        last_error_class = %s, last_error = %s
+                    WHERE id = %s
+                    """,
+                    (new_state, delay, error_class, str(error), claimed.job.id),
+                )
 
     return new_state
 

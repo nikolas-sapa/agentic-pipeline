@@ -92,3 +92,11 @@ They are left exactly as they ran, because fixing them would change what the
 committed raw data means without a re-run. They are handled by reporting
 accuracy conditional on parsing, and they do not touch the cost result: a call
 that failed to parse still spent real, correctly counted tokens.
+
+## Live MBPP safety
+
+MBPP grading executes model-authored Python on the host. The separate
+interpreter, socket monkeypatch and timeout do not sandbox filesystem, process
+or network access. Run live grading only in a disposable sandbox without
+sensitive files, credentials or host access. Offline replay does not execute
+model-authored code.

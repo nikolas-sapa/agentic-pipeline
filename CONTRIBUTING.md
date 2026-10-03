@@ -37,7 +37,11 @@ uv run python -m spine.worker
 ## Tests
 
 ```
-make test             # pytest -q, against the Postgres above
+# Tests truncate application tables. Use a dedicated disposable database,
+# never a production or development database containing data you need.
+docker exec spine-pg createdb -U spine spine_test
+export SPINE_TEST_DATABASE_URL=postgresql://spine:spine@localhost:5432/spine_test
+make test             # pytest -q, against the explicit test database
 ```
 
 ## The benchmark
@@ -52,7 +56,10 @@ make bench-check      # fails if RESULTS.md is stale relative to the raw data
 
 `bench-replay` needs no API key, no network, and no model calls; it reads only
 `bench/data/raw/*.jsonl`. Re-running the live benchmark spends real API quota
-and takes about an hour — see `bench/README.md` before doing that.
+and takes about an hour — see `bench/README.md` before doing that. Live MBPP
+grading executes model-authored Python on the host. Its separate interpreter,
+socket monkeypatch and timeout are not a security sandbox. Run it only in a
+disposable sandbox with no sensitive files, credentials or host access.
 
 ## Layout
 

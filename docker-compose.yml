@@ -6,8 +6,8 @@ services:
   phoenix:
     image: arizephoenix/phoenix:latest
     ports:
-      - "6006:6006"
-      - "4317:4317"
+      - "127.0.0.1:6006:6006"
+      - "127.0.0.1:4317:4317"
     volumes:
       - phoenix-data:/mnt/data
 

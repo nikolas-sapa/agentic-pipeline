@@ -22,6 +22,7 @@ scaffolding needed.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import urllib.request
@@ -101,19 +102,20 @@ async def _raise_alert(
 
     webhook_url = environ.get("ALERT_WEBHOOK_URL")
     if webhook_url:
-        _post_webhook(webhook_url, line)
+        await asyncio.to_thread(_post_webhook, webhook_url, line)
 
 
 def _post_webhook(url: str, payload: dict) -> None:
     """Unset by default (plan §5) — no account required to run the repo.
-    stdlib only: the alert is already durable in the DB and stderr before
-    this runs, so a failed POST is swallowed, not raised."""
+    stdlib only: the alert row is inserted and stderr is written before
+    this runs; a failed POST is swallowed so the DB transaction can commit."""
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
     try:
-        urllib.request.urlopen(req, timeout=5)
+        with urllib.request.urlopen(req, timeout=5):
+            pass
     except OSError:
         pass
