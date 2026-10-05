@@ -76,21 +76,21 @@ async def run(
             # an undeclared bug) and the retry-vs-dead_letter decision both
             # live in queue.fail() — the worker just routes the exception
             # there (plan §4).
-            await hooks.on_attempt_end(ctx, "failed")
             async with pool.connection() as conn:
                 new_state = await fail(conn, claimed, error)
+            await hooks.on_attempt_end(ctx, "failed" if new_state is not None else "stale")
             # on_job_finish fires only when the job reaches a terminal state;
             # a job requeued for retry isn't finished yet.
             if new_state == JobState.DEAD_LETTER:
                 await hooks.on_job_finish(ctx, "dead_lettered")
             continue
 
-        await hooks.on_attempt_end(ctx, "succeeded")
-
         async with pool.connection() as conn:
-            await complete(conn, claimed, result)
+            accepted = await complete(conn, claimed, result)
 
-        await hooks.on_job_finish(ctx, "success")
+        await hooks.on_attempt_end(ctx, "succeeded" if accepted else "stale")
+        if accepted:
+            await hooks.on_job_finish(ctx, "success")
 
 
 def main() -> None:

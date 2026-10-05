@@ -39,11 +39,13 @@ def extract_code(text: str):
 
 
 def grade(code: str, test_imports, test_list):
-    """Run the model's code against MBPP's asserts in an isolated subprocess.
+    """Run model-authored code against MBPP asserts in a separate subprocess.
 
     Model-authored code is executed, so: separate interpreter (never in-process
     exec), -I to ignore the ambient environment, sockets stubbed out, minimal
-    PATH, hard 10s timeout. Returns (ran, correct).
+    PATH, hard 10s timeout. These are not a security sandbox: code still has
+    host filesystem/process access and can bypass the socket patch. Run live
+    grading only inside a disposable sandbox. Returns (ran, correct).
     """
     if code is None:
         return False, False

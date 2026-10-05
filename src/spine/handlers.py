@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Awaitable, Callable
 
-from spine.model import Event, HandlerResult, JobContext
+from spine.model import Event, HandlerResult, JobContext, TerminalError
 
 Handler = Callable[[JobContext], Awaitable[HandlerResult]]
 
@@ -17,7 +17,10 @@ def register(source: str, type: str, fn: Handler) -> None:
 
 
 def resolve(event: Event) -> Handler:
-    return _registry[(event.source, event.type)]
+    try:
+        return _registry[(event.source, event.type)]
+    except KeyError as error:
+        raise TerminalError("unknown_handler") from error
 
 
 async def echo_handler(ctx: JobContext) -> HandlerResult:

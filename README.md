@@ -16,7 +16,7 @@ make install                 # uv sync
 # spine (needs Postgres; DATABASE_URL defaults to postgresql://spine:spine@localhost:5432/spine)
 uv run uvicorn spine.ingress:app --reload
 uv run python -m spine.worker
-make test                    # pytest, against real Postgres
+make test                    # requires disposable SPINE_TEST_DATABASE_URL
 
 # the finding below, reproduced offline in ~0.1s, no API key or network
 make bench-replay
@@ -143,10 +143,21 @@ duplicate execution and silent loss rather than throughput.
   grounds that a handler bug should not be indistinguishable from bad input.
 - **Lease reaper.** A crashed worker's job is reclaimed, its open attempt closed
   as `lease_expired`, and routed through the same retry-vs-dead-letter decision
-  rather than a second code path.
+  rather than a second code path. A reclaimed attempt cannot overwrite a newer
+  attempt's result. Leases do not provide exactly-once external side effects:
+  handlers must tolerate overlap if they run past the lease.
 - **DLQ is a query, not a table.** `GET /jobs?state=dead_letter`.
 - **Replay mints a new job** from the original event with `replay_of` lineage,
   predicated on the job being dead-lettered. The dead job is never resurrected.
+
+This HTTP surface is for trusted local use. It has no authentication, request
+limits or access controls; listing jobs exposes handler outputs and errors.
+Do not expose it publicly without a separate access-control and resource-limit
+design. The bundled observability viewer binds only to loopback.
+
+The tests run against an explicitly configured disposable Postgres database
+(`SPINE_TEST_DATABASE_URL`), and truncate its application tables. They never
+fall back to the application's `DATABASE_URL`.
 
 The tests run against real Postgres. Mocking `SKIP LOCKED` or `ON CONFLICT`
 would test nothing.
@@ -171,7 +182,7 @@ make install                 # uv sync
 # spine (needs Postgres; DATABASE_URL defaults to postgresql://spine:spine@localhost:5432/spine)
 uv run uvicorn spine.ingress:app --reload
 uv run python -m spine.worker
-make test                    # pytest, against real Postgres
+make test                    # requires disposable SPINE_TEST_DATABASE_URL
 
 # benchmark
 make bench-replay            # recompute bench/RESULTS.md from committed raw data
