@@ -1,5 +1,6 @@
 # agentic-pipeline
 
+[![CI](https://github.com/nikolas-sapa/agentic-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/nikolas-sapa/agentic-pipeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-F3F2EE?style=flat-square&labelColor=0B0B0D)](LICENSE)
 [![Python >=3.12](https://img.shields.io/badge/python-3.12%2B-F3F2EE?style=flat-square&labelColor=0B0B0D)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-F3F2EE?style=flat-square&labelColor=0B0B0D)](CONTRIBUTING.md)
